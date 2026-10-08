@@ -47,8 +47,11 @@ top eligible (killable) processes by phys_footprint:
   that jetsam itself trends on and that falls *smoothly* as memory fills (unlike the
   bucketed pressure level). It **never** triggers on memory footprint: a healthy Mac
   can sit at a huge footprint of compressed/sparse data while perfectly green.
-  Footprint is only used to *rank* victims. Secondary trigger: swap used past a
-  configurable multiple of RAM.
+  Footprint is only used to *rank* victims. A level below the panic threshold
+  kills on the first sample; above it, trips accumulate in a leaky bucket so an
+  oscillating burst still arms. Two swap arms back it up: swap growing faster
+  than a set rate (the one that discriminates a runaway), and swap past a
+  multiple of RAM as a last resort.
 - **Ranks victims by `ri_phys_footprint`** (`proc_pid_rusage`) — the same metric
   Activity Monitor's "Memory" column and jetsam use. (A swapped hog's RSS collapses,
   and footprint measured from outside overcounts compressed pages — `phys_footprint`
@@ -57,12 +60,23 @@ top eligible (killable) processes by phys_footprint:
   `kernel_task`, `coreaudiod`, …) **and** a location rule — it will only ever kill
   executables under `/Applications`, `/Users`, `/opt/homebrew`, or `/usr/local`. A
   system daemon, WindowServer, or the kernel can never be the victim.
-- **Self-protects**: runs as root at `nice -20` and calls `mlockall()` so the killer
-  is never swapped out when it's needed most. The hot poll loop does **zero
+- **Kills the family when a pool respawns**: a harness that runs jobs in a pool
+  (a `ThreadPoolExecutor` around `subprocess.run`, a `multiprocessing` pool) starts
+  a fresh worker for every one killed, and the fresh one regrows. A second,
+  different victim from the same process group within `OOMG_FAMILY_WINDOW_S` kills
+  the whole group, but never a group that contains an installed app bundle
+  (browsers, IDEs and Electron apps keep all their helpers in one group). After a
+  kill it waits while the victim visibly releases memory instead of shooting the
+  next-biggest process meanwhile.
+- **Self-protects** as far as macOS allows: runs as root at `nice -20`. There is no
+  page lock: macOS does not implement `mlockall()` (it returns `ENOSYS`), so the
+  guard's pages are as swappable as anyone's. The hot poll loop does **zero
   fork/exec and zero per-iteration allocation** (pure `ctypes` sysctl/libproc);
-  full process enumeration happens only once it's already near the threshold.
+  full process enumeration happens only once it's already near the threshold. A
+  guard on the contended resource can still be starved out at the very end; the
+  module docstring records when that happened.
 
-No dependencies — pure Python 3 stdlib + `ctypes`. Single file. Apple Silicon and
+No dependencies — pure Python 3.9+ stdlib + `ctypes`. Single file. Apple Silicon and
 Intel.
 
 ## Install
@@ -76,21 +90,33 @@ python3 macos_oom_guard.py --status
 python3 macos_oom_guard.py --run --dry-run
 
 # 3. Install as a boot-time root LaunchDaemon (armed):
-sudo python3 macos_oom_guard.py --install
+sudo /usr/bin/python3 macos_oom_guard.py --install
 
 # Uninstall:
-sudo python3 macos_oom_guard.py --uninstall
+sudo /usr/bin/python3 macos_oom_guard.py --uninstall
 ```
 
-The installer writes `/Library/LaunchDaemons/io.github.fl4p.macos-oom-guard.plist`
-and bootstraps it with `launchctl`. Logs go to `/var/log/macos-oom-guard.log`:
+The installer copies the script to `/usr/local/libexec/macos-oom-guard/` (owned by
+root, and it refuses if that directory or any parent is writable by anyone else),
+writes `/Library/LaunchDaemons/io.github.fl4p.macos-oom-guard.plist` to run that
+copy with `/usr/bin/python3`, and bootstraps it with `launchctl`. A root daemon
+therefore never executes a user-writable file or interpreter. **Re-run `--install`
+after updating the script**; editing your checkout does not change what runs.
+
+The plist pins `DEVELOPER_DIR=/Library/Developer/CommandLineTools`: `/usr/bin/python3`
+otherwise resolves to Xcode.app when it is selected, and Xcode's tools stop running
+after an update until its new license is accepted, which would leave the guard dead
+at boot. So the Command Line Tools must be installed (`xcode-select --install`);
+`--install` runs that interpreter first and refuses if it does not work.
+
+Logs go to `/var/log/macos-oom-guard.log`:
 
 ```bash
 tail -f /var/log/macos-oom-guard.log
 ```
 
-To install in dry-run mode (logs would-be kills but never acts), set
-`OOMG_DRY_RUN=1` before `--install` (it's baked into the plist).
+To install in dry-run mode (logs would-be kills but never acts), add `--dry-run`
+to `--install` (it's baked into the plist).
 
 ## Configuration
 
@@ -98,12 +124,17 @@ All tunable via environment variables (also baked into the plist at `--install`)
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `OOMG_CRIT_LEVEL` | kill when `memorystatus_level` drops below this | `10` |
+| `OOMG_PANIC_LEVEL` | kill on the first sample below this level | `5` |
+| `OOMG_CRIT_LEVEL` | kill after the strikes when `memorystatus_level` is below this | `10` |
 | `OOMG_WARN_LEVEL` | start logging/enumerating below this | `25` |
-| `OOMG_SWAP_MULT` | also kill when `swap_used > MULT × RAM` (and level < 20) | `1.5` |
+| `OOMG_SWAP_MULT` | also kill when `swap_used > MULT × RAM` (and level < 20) | `1.0` |
+| `OOMG_SWAP_RATE_GB` | also kill when swap grows by more than this… | `8.0` |
+| `OOMG_SWAP_RATE_S` | …within this many seconds | `6.0` |
 | `OOMG_MIN_VICTIM_GB` | never kill a process smaller than this footprint | `1.5` |
-| `OOMG_STRIKES` | consecutive trips required before killing | `2` |
+| `OOMG_STRIKES` | trips required before killing (leaky bucket, not reset) | `2` |
+| `OOMG_STRIKE_DECAY` | bucket drain per clean sample; must be < 1 | `0.5` |
 | `OOMG_POLL_S` | poll interval, seconds | `1.0` |
+| `OOMG_FAMILY_WINDOW_S` | a repeat victim's process group within this window is killed whole; `0` disables | `300` |
 | `OOMG_DRY_RUN` | `1` = log but never kill | `0` |
 
 ## Choosing what gets killed
@@ -123,8 +154,14 @@ leaks.
   strictly better than a kernel panic, which loses **all** unsaved work everywhere.
 - Run `--status` and `--run --dry-run` first to satisfy yourself the victim
   selection matches your expectations before arming it.
-- It requires root to install (LaunchDaemon, `mlockall`, killing other users'
+- It requires root to install (LaunchDaemon, `nice -20`, killing other users'
   processes).
+
+## Tests
+
+```bash
+python3 -m pytest -q tests
+```
 
 ## License
 

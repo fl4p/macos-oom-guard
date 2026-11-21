@@ -31,7 +31,8 @@ HOST_RAM_GB = 39.0
 def cfg(**overrides):
     """A Cfg built from the shipped defaults, with explicit overrides."""
     keys = ("PANIC_LEVEL", "CRIT_LEVEL", "WARN_LEVEL", "SWAP_MULT", "SWAP_RATE_GB",
-            "SWAP_RATE_S", "MIN_VICTIM_GB", "STRIKES", "POLL_S", "FAMILY_WINDOW_S", "DRY_RUN")
+            "SWAP_RATE_S", "MIN_VICTIM_GB", "STRIKES", "POLL_S", "FAMILY_WINDOW_S", "DRY_RUN",
+            "HOG_FRAC", "HOG_LEVEL", "FILL_MULT", "FILL_GB", "FILL_S", "FILL_LEVEL")
     saved = {f"OOMG_{k}": os.environ.pop(f"OOMG_{k}", None) for k in keys}
     try:
         for key, value in overrides.items():
@@ -713,3 +714,215 @@ def test_install_refuses_a_user_writable_ancestor(tmp_path):
 def test_the_real_install_ancestors_are_root_only():
     for p in ("/", "/usr", "/usr/local", "/usr/local/libexec"):
         oomg._require_root_only(p)
+
+
+# --------------------------------------------------------------------------- #
+# the hog arm (2026-10-11)
+# --------------------------------------------------------------------------- #
+#: Every sample the guard logged while one python job grew to 54.6 GB, as
+#: (level, swap GB, growth GB/6 s or None). The heartbeat lines carry the
+#: interval's worst level, which is the reading used here.
+RUNAWAY_2026_10_11 = [
+    (34, 18.2, None),   # 11:53:08 heartbeat, worst of the minute
+    (40, 18.0, None),   # 11:54:09
+    (23, 21.5, 1.1),    # 11:54:23 warn
+    (23, 34.4, 2.6),    # 11:55:02 warn
+    (23, 36.5, None),   # 11:55:09 heartbeat
+    (30, 38.7, None),   # 11:56:10
+    (32, 38.7, None),   # 11:57:10
+]
+#: The runaway's footprint in the first jetsam report (11:55:08), and the
+#: biggest legitimate job measured on this host (Palace solve, whole tree).
+RUNAWAY_GB = 53.2
+LARGEST_LEGIT_JOB_GB = 22.6
+
+
+def drive_hog(samples, config, hog_gb, swap_kill=None):
+    swap_kill = config.swap_mult * HOST_RAM_GB if swap_kill is None else swap_kill
+    hog_kill = config.hog_frac * HOST_RAM_GB
+    strikes, actions = 0, []
+    for level, swap, growth in samples:
+        verdict = oomg.evaluate(level, swap, growth, strikes, config, swap_kill, hog_gb, hog_kill)
+        strikes = verdict.strikes
+        actions.append((verdict.action, verdict.why))
+    return actions
+
+
+def test_the_2026_10_11_runaway_reached_none_of_the_old_arms():
+    """The defect, recorded: with no hog input the guard watched it all happen."""
+    actions = drive_hog(RUNAWAY_2026_10_11, cfg(), hog_gb=None)
+    assert all(a == "clear" for a, _why in actions), actions
+
+
+def test_the_2026_10_11_runaway_is_killed_by_the_hog_arm():
+    actions = drive_hog(RUNAWAY_2026_10_11, cfg(), hog_gb=RUNAWAY_GB)
+    assert actions[:2] == [("arm", "hog"), ("kill", "hog")], actions
+
+
+def test_the_hog_threshold_sits_between_legit_jobs_and_the_runaway():
+    hog_kill = cfg().hog_frac * HOST_RAM_GB
+    assert LARGEST_LEGIT_JOB_GB < hog_kill < RUNAWAY_GB
+
+
+def test_the_largest_legitimate_job_never_trips_the_hog_arm():
+    # even at the runaway's own pressure readings
+    actions = drive_hog(RUNAWAY_2026_10_11, cfg(), hog_gb=LARGEST_LEGIT_JOB_GB)
+    assert all(a == "clear" for a, _why in actions), actions
+
+
+def test_a_big_job_with_memory_to_spare_is_left_alone():
+    conf = cfg()
+    actions = drive_hog([(conf.hog_level, 5.0, 0.0)] * 10, conf, hog_gb=RUNAWAY_GB)
+    assert all(a == "clear" for a, _why in actions), actions
+
+
+def test_the_hog_arm_is_monotone():
+    """A bigger hog or a lower level must never turn a trip back into a clear."""
+    conf = cfg()
+    hog_kill = conf.hog_frac * HOST_RAM_GB
+    for level in range(conf.panic_level, conf.hog_level):
+        for hog in (hog_kill + 0.1, RUNAWAY_GB, 200.0, 1e4):
+            verdict = oomg.evaluate(level, 0.0, None, 0, conf, 1e9, hog, hog_kill)
+            assert verdict.action != "clear", (level, hog)
+
+
+def test_an_unmeasured_hog_never_trips_and_never_clears_the_other_arms():
+    conf = cfg()
+    assert oomg.evaluate(30, 0.0, None, 0, conf, 1e9, None, 1.0).action == "clear"
+    assert oomg.evaluate(conf.crit_level - 1, 0.0, None, 0, conf, 1e9, None, 1.0).why == "level"
+
+
+def test_the_hog_arm_names_itself_when_the_level_arm_also_fires():
+    """So the run loop kills the hog, not whatever else is biggest."""
+    conf = cfg()
+    verdict = oomg.evaluate(conf.crit_level - 1, 0.0, None, 0, conf, 1e9, RUNAWAY_GB, 29.0)
+    assert verdict.why == "hog"
+
+
+def test_largest_job_skips_apps_and_system_processes(monkeypatch):
+    procs = {
+        101: ("/Applications/VMware Fusion.app/Contents/Library/vmware-vmx", 60.0),
+        102: ("/usr/libexec/someDaemon", 70.0),
+        103: ("/opt/homebrew/Cellar/python@3.13/3.13.1/Frameworks/Python.framework/"
+              "Versions/3.13/Resources/Python.app/Contents/MacOS/Python", 54.6),
+        104: ("/Users/alice/.venv/bin/python3", 3.0),
+    }
+    monkeypatch.setattr(oomg, "_list_pids", lambda *a, **k: list(procs))
+    monkeypatch.setattr(oomg, "_pid_path", lambda pid: procs[pid][0])
+    monkeypatch.setattr(oomg, "_footprint_gb", lambda pid: procs[pid][1])
+    assert oomg.largest_job(set())[:2] == (103, 54.6)
+    assert oomg.largest_job({103})[:2] == (104, 3.0)
+
+
+def test_plist_carries_the_hog_tunables():
+    xml = oomg._plist(oomg.DAEMON_PYTHON, oomg.INSTALL_SCRIPT, cfg(hog_frac=0.6, hog_level=40))
+    assert "<key>OOMG_HOG_FRAC</key><string>0.6</string>" in xml
+    assert "<key>OOMG_HOG_LEVEL</key><string>40</string>" in xml
+
+
+# --------------------------------------------------------------------------- #
+# the fill arm (2026-11-21)
+# --------------------------------------------------------------------------- #
+#: The guard's own heartbeats (instantaneous level, swap GB), one a minute,
+#: 13:02-13:14, while four ngspice workers filled swap. Jetsam started killing
+#: for vm-compressor-space-shortage at 13:14:45.
+FILL_2026_11_21 = [
+    (36, 21.5), (35, 24.1), (50, 24.6), (39, 24.5), (36, 24.9), (36, 28.5),
+    (46, 29.1), (50, 28.9), (37, 28.8), (35, 31.7), (35, 34.6), (35, 36.7),
+    (35, 39.0),
+]
+FILL_2026_11_21_JETSAM_INDEX = 12  # the 13:14 sample
+
+
+def drive_fill(samples, config, ram=HOST_RAM_GB, step_s=60.0):
+    """Replay (level, swap) samples taken every step_s; growth over fill_s from them."""
+    lag = max(1, round(config.fill_s / step_s))
+    swap_kill = config.swap_mult * ram
+    fill_kill = config.fill_mult * ram
+    strikes, actions = 0, []
+    for i, (level, swap) in enumerate(samples):
+        fill_growth = swap - samples[i - lag][1] if i >= lag else None
+        verdict = oomg.evaluate(level, swap, None, strikes, config, swap_kill,
+                                None, float("inf"), fill_growth, fill_kill)
+        strikes = verdict.strikes
+        actions.append((verdict.action, verdict.why))
+    return actions
+
+
+def test_the_2026_11_21_fill_reached_none_of_the_old_arms():
+    """The defect, recorded: the level stayed in the 30s, so nothing fired."""
+    conf = cfg()
+    strikes = 0
+    for level, swap in FILL_2026_11_21:
+        verdict = oomg.evaluate(level, swap, 0.3, strikes, conf, conf.swap_mult * HOST_RAM_GB)
+        strikes = verdict.strikes
+        assert verdict.action == "clear", (level, swap, verdict)
+
+
+def test_the_2026_11_21_fill_is_killed_before_jetsam():
+    actions = drive_fill(FILL_2026_11_21, cfg())
+    kills = [i for i, (a, why) in enumerate(actions) if a == "kill"]
+    assert kills and kills[0] < FILL_2026_11_21_JETSAM_INDEX, actions
+    assert actions[kills[0]][1] == "fill"
+
+
+def test_the_fill_threshold_sits_below_every_ceiling_this_host_reached():
+    """Excursions that ended in a kill or crash peaked at 36-40 GB of swap."""
+    assert cfg().fill_mult * HOST_RAM_GB < 36.0
+
+
+def test_a_high_but_flat_swap_plateau_is_left_alone():
+    """2026-09-30 12:31-13:18: 30-33 GB, creeping, and the machine was fine."""
+    conf = cfg()
+    plateau = [(35, 31.0 + 0.04 * i) for i in range(48)]
+    assert all(a == "clear" for a, _why in drive_fill(plateau, conf))
+    # and a stable 40 GB at level 33, the documented normal working state
+    assert oomg.evaluate(33, 40.0, 0.0, 0, conf, 1e9, None, float("inf"),
+                         0.0, conf.fill_mult * HOST_RAM_GB).action == "clear"
+
+
+def test_stale_swap_after_the_pressure_has_passed_is_left_alone():
+    """After a kill swap stays high while the level recovers; that is not distress."""
+    conf = cfg()
+    v = oomg.evaluate(conf.fill_level, 37.0, None, 0, conf, 1e9, None, float("inf"),
+                      conf.fill_gb + 3.0, conf.fill_mult * HOST_RAM_GB)
+    assert v.action == "clear"
+
+
+def test_unevaluable_fill_growth_never_trips():
+    conf = cfg()
+    v = oomg.evaluate(30, 38.0, None, 0, conf, 1e9, None, float("inf"),
+                      None, conf.fill_mult * HOST_RAM_GB)
+    assert v.action == "clear"
+
+
+def test_the_fill_arm_is_monotone():
+    """Worse input (more swap, faster growth, lower level) never clears a trip."""
+    conf = cfg()
+    fill_kill = conf.fill_mult * HOST_RAM_GB
+    base = (35, fill_kill + 0.5, conf.fill_gb + 0.5)
+    assert oomg.evaluate(base[0], base[1], None, 0, conf, 1e9, None, float("inf"),
+                         base[2], fill_kill).action == "arm"
+    for level in range(0, base[0] + 1):
+        for swap in (base[1], base[1] + 5, base[1] + 50):
+            for g in (base[2], base[2] * 4, 100.0):
+                v = oomg.evaluate(level, swap, None, 0, conf, 1e9, None, float("inf"), g, fill_kill)
+                assert v.action != "clear", (level, swap, g)
+
+
+def test_the_fill_window_survives_the_history_trim():
+    """The run loop keeps 2x the longest window, so fill growth is evaluable."""
+    conf = cfg()
+    history = [(t, 20.0 + 0.02 * t) for t in range(0, int(conf.fill_s * 2) + 1)]
+    now = history[-1][0]
+    keep = [(w, v) for w, v in history if now - w <= max(conf.swap_rate_s, conf.fill_s) * 2]
+    assert oomg.swap_growth_gb(keep, conf.fill_s, now) == pytest.approx(0.02 * conf.fill_s)
+
+
+def test_the_plist_carries_the_fill_tunables():
+    conf = cfg(fill_mult=0.8, fill_gb=2.0, fill_s=90, fill_level=45)
+    import plistlib
+    env = plistlib.loads(oomg._plist("/usr/bin/python3", "/x.py", conf).encode())[
+        "EnvironmentVariables"]
+    assert (env["OOMG_FILL_MULT"], env["OOMG_FILL_GB"], env["OOMG_FILL_S"],
+            env["OOMG_FILL_LEVEL"]) == ("0.8", "2.0", "90.0", "45")

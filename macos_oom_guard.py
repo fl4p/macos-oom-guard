@@ -26,9 +26,11 @@ DESIGN
 ------
 * Trigger on `kern.memorystatus_level` — a 0..100 "% memory available" gauge that
   jetsam itself trends on and that drops smoothly as memory fills (UNLIKE the
-  bucketed pressure level). Secondary trigger: swap used past a multiple of RAM.
-  We NEVER trigger on footprint — a healthy box can sit at a huge footprint of
-  compressed/sparse data while perfectly green; footprint only RANKS victims.
+  bucketed pressure level). Secondary triggers: swap used past a multiple of RAM,
+  and swap growth. Total footprint never triggers — a healthy box can sit at a
+  huge footprint of compressed/sparse data while perfectly green. The one
+  footprint trigger is per process: a single non-app job past a fraction of RAM
+  while the level is below a gate (the hog arm, see REVISION 2026-10-11).
 * Rank victims by `ri_phys_footprint` from proc_pid_rusage — the same metric
   Activity Monitor's "Memory" column and jetsam use. (RSS of a swapped hog
   collapses; outside-measured footprint overcounts — phys_footprint is the honest one.)
@@ -80,7 +82,13 @@ Tunables (env, also settable in the plist via --install flags):
   OOMG_POLL_S       poll interval seconds                          (default 1.0)
   OOMG_FAMILY_WINDOW_S a repeat victim's process group within this many
                     seconds is killed whole; 0 disables             (default 300)
-  OOMG_DRY_RUN      1 = log but never kill                         (default 0)
+  OOMG_HOG_FRAC     one non-app process past FRAC*RAM trips ...     (default 0.75)
+  OOMG_HOG_LEVEL    ... while memorystatus_level is below this      (default 50)
+  OOMG_FILL_MULT    swap past MULT*RAM ...                         (default 0.85)
+  OOMG_FILL_GB      ... and still growing by more than this ...    (default 1.0)
+  OOMG_FILL_S       ... over this trailing window, seconds ...     (default 120)
+  OOMG_FILL_LEVEL   ... while memorystatus_level is below this     (default 50)
+  OOMG_DRY_RUN     1 = log but never kill                         (default 0)
 
 REVISION 2026-08-27 — three defects, found by reading 82317 samples of this
 guard's own log (2026-06-14 .. 2026-08-27) after it sat silent through a kernel
@@ -132,6 +140,49 @@ REVISION 2026-10-04 — the guard fired five times and the host still panicked
   was killing for vm-compressor-space-shortage at 20:39:57), and the launchd
   restart logged one sample at 20:40:12 and was never scheduled again. A restart
   also loses the kill history, so the first kill after it is a single one again.
+
+REVISION 2026-10-11 — one python job grew to 54.6 GB on this 39 GB host in about
+four minutes (11:53-11:57), and the guard logged two warnings and nothing else.
+Jetsam killed system daemons ~12000 times for vm-compressor-space-shortage and,
+by doing so, held memorystatus_level at 23 or above, so no arm could fire:
+
+* level: lowest sample 23, against crit 10 / panic 5.
+* swap: peak 38.7 GB, under the 1.0*RAM backstop, and the level was 30-35 then,
+  above the swap arm's gate of 20.
+* rate: peak +2.6 GB/6 s, against 8 GB/6 s.
+
+The kernel defends the gauge by killing everything else, so a job that grows
+at a few GB per minute never pushes the level down far enough for a level arm.
+The new hog arm trips on the one process instead: a non-app job past
+HOG_FRAC*RAM (29 GB here) while the level is under HOG_LEVEL. The fraction sits
+above every other single process this host's jetsam reports hold (pool workers
+of 20-22 GB on 2026-10-04, which the family kill handles) and above the largest
+legitimate job measured here (a 22.6 GB Palace solve, whole tree), and far
+below the runaway; apps are
+excluded because a VM or a browser may hold most of RAM on purpose. The scan
+costs ~4 ms and runs only below the level gate.
+
+REVISION 2026-11-21 — four ngspice workers (~8 GB each, 30-33 GB together) took
+swap from 13 to 39 GB over 35 minutes (12:40-13:14). Jetsam then killed ~7500
+system processes for vm-compressor-space-shortage. The guard logged "ok" every
+minute: the level sat at 34-38 throughout, so the swap arm (gate 20), the rate
+arm (gate 25, and +1-3 GB/min against 8 GB/6 s) and the level arms never moved,
+and the hog arm could not see it because no single process was near 29 GB.
+
+On this host jetsam does not let the level fall; it holds it in the mid-30s by
+killing other processes while swap climbs into the high 30s. Since June, every
+excursion that climbed to 36-40 GB of swap ended with swap collapsing by 8+ GB
+within a minute (something was killed) or with a panic. The fill arm trips on
+that approach directly and does not wait for the level: swap past
+FILL_MULT*RAM (33 GB here) and still growing by more than FILL_GB over FILL_S,
+while the level is under FILL_LEVEL. Growth is required, so a high but
+stable swap (a normal working state here) never trips it, and neither does
+stale swap left behind after the pressure has passed. Replayed over the
+heartbeat log (2026-06-14 to 2026-11-21), it trips in 34 distinct hours. In 26
+of them swap collapsed within 30 min (a kill or crash; this includes 2026-08-26/27,
+2026-10-11 and today, which it would have caught about two minutes before
+jetsam). The other 8 were plateaus at 33-38 GB, where the arm would also have
+killed the largest job.
 """
 import argparse
 import collections
@@ -334,6 +385,28 @@ def find_victim(min_gb, exclude_pids):
     return None, best_gb, best_path
 
 
+def largest_job(exclude_pids):
+    """(pid, footprint_gb, path) of the biggest eligible process that is not an app.
+
+    The hog arm's input. Apps are left out on purpose: a VM, a browser or an IDE
+    may legitimately hold most of RAM, while a single CLI job that does is a
+    runaway. (None, 0.0, '') if there is none.
+    """
+    best_pid, best_gb, best_path = None, 0.0, ""
+    for pid in _list_pids():
+        if pid in exclude_pids:
+            continue
+        path = _pid_path(pid)
+        if not path or not path.startswith(KILLABLE_PREFIXES):
+            continue
+        if _basename(path) in PROTECT_NAMES or _is_app(path):
+            continue
+        gb = _footprint_gb(pid)
+        if gb > best_gb:
+            best_pid, best_gb, best_path = pid, gb, path
+    return best_pid, best_gb, best_path
+
+
 # A job's own wrapper processes live in its group but outside KILLABLE_PREFIXES:
 # the shell an agent or a script runs the job under, and the launchers in front
 # of it. They may die with the job. Anything else from the system means the
@@ -532,6 +605,12 @@ class Cfg:
         self.strike_decay = float(os.environ.get("OOMG_STRIKE_DECAY", 0.5))
         self.poll_s = float(os.environ.get("OOMG_POLL_S", 1.0))
         self.family_window_s = float(os.environ.get("OOMG_FAMILY_WINDOW_S", 300.0))
+        self.hog_frac = float(os.environ.get("OOMG_HOG_FRAC", 0.75))
+        self.hog_level = int(os.environ.get("OOMG_HOG_LEVEL", 50))
+        self.fill_mult = float(os.environ.get("OOMG_FILL_MULT", 0.85))
+        self.fill_gb = float(os.environ.get("OOMG_FILL_GB", 1.0))
+        self.fill_s = float(os.environ.get("OOMG_FILL_S", 120.0))
+        self.fill_level = int(os.environ.get("OOMG_FILL_LEVEL", 50))
         self.dry_run = os.environ.get("OOMG_DRY_RUN", "0") not in ("0", "", "false", "False")
 
 
@@ -558,20 +637,35 @@ def swap_growth_gb(history, window_s, now):
     return inside[-1][1] - inside[0][1]
 
 
-def evaluate(level, swap, growth, strikes, cfg, swap_kill):
+def evaluate(level, swap, growth, strikes, cfg, swap_kill, hog_gb=None, hog_kill=float("inf"),
+             fill_growth=None, fill_kill=float("inf")):
     """Decide on one sample. Pure, so the calibration is testable.
 
-    Three arms, cheapest first. `growth` is the value from swap_growth_gb and
-    may be None; None never trips and never clears anything else.
+    Five arms. `growth` is the value from swap_growth_gb and may be None; None
+    never trips and never clears anything else. `hog_gb` is the footprint of
+    the largest non-app process (largest_job), None when it was not measured;
+    it trips past `hog_kill` while the level is under cfg.hog_level.
+    `fill_growth` is swap growth over cfg.fill_s (None = not evaluable); the
+    fill arm trips when swap is past `fill_kill` and still growing by more
+    than cfg.fill_gb, while the level is under cfg.fill_level.
     """
     if level < cfg.panic_level:
         # Severity outranks persistence. Confirming this over two more polls is
         # not caution, it is the extra two seconds that loses the machine.
         return Verdict(0.0, "kill", "panic")
-    if level < cfg.crit_level:
+    if hog_gb is not None and hog_gb > hog_kill and level < cfg.hog_level:
+        # First among the rest so the victim is the hog itself, not whatever
+        # else happens to be biggest when the level arm would also have fired.
+        why = "hog"
+    elif level < cfg.crit_level:
         why = "level"
     elif swap > swap_kill and level < SWAP_LEVEL_GATE:
         why = "swap"
+    elif (fill_growth is not None and swap > fill_kill and fill_growth > cfg.fill_gb
+          and level < cfg.fill_level):
+        # Jetsam holds the level in the 30s while swap fills to the ceiling
+        # (REVISION 2026-11-21), so this arm cannot wait for the level.
+        why = "fill"
     elif growth is not None and growth > cfg.swap_rate_gb and level < cfg.warn_level:
         why = "rate"
     else:
@@ -614,6 +708,8 @@ def run(cfg, logfile="/var/log/macos-oom-guard.log"):
         fh = sys.stderr
     ram = phys_ram_gb()
     swap_kill = cfg.swap_mult * ram
+    hog_kill = cfg.hog_frac * ram
+    fill_kill = cfg.fill_mult * ram
     exclude = {os.getpid(), os.getppid()}
     own_pgids = {os.getpgrp(), _pgid(os.getppid())}
     protection = _self_protect()
@@ -621,6 +717,8 @@ def run(cfg, logfile="/var/log/macos-oom-guard.log"):
              f"panic_level<{cfg.panic_level} crit_level<{cfg.crit_level} "
              f"warn<{cfg.warn_level} swap_kill>{swap_kill:.0f}GB "
              f"swap_rate>{cfg.swap_rate_gb:.0f}GB/{cfg.swap_rate_s:.0f}s "
+             f"hog>{hog_kill:.0f}GB@level<{cfg.hog_level} "
+             f"fill>{fill_kill:.0f}GB+{cfg.fill_gb:g}GB/{cfg.fill_s:.0f}s@level<{cfg.fill_level} "
              f"min_victim={cfg.min_victim_gb}GB "
              f"strikes={cfg.strikes} family_window={cfg.family_window_s:.0f}s "
              f"dry_run={cfg.dry_run} self_protect=[{protection}]")
@@ -653,24 +751,37 @@ def run(cfg, logfile="/var/log/macos-oom-guard.log"):
                      f"(interval {cfg.poll_s}s) — the guard was not scheduled")
         last_poll = now
         history.append((now, swap))
-        while history and now - history[0][0] > cfg.swap_rate_s * 2:
+        while history and now - history[0][0] > max(cfg.swap_rate_s, cfg.fill_s) * 2:
             history.popleft()
         growth = swap_growth_gb(history, cfg.swap_rate_s, now)
+        fill_growth = swap_growth_gb(history, cfg.fill_s, now)
         worst_level = min(worst_level, level)
         peak_swap = max(peak_swap, swap)
 
-        verdict = evaluate(level, swap, growth, strikes, cfg, swap_kill)
+        # The hog scan enumerates every process (~4 ms), so only below the gate
+        # it is needed at: a healthy box keeps a scan-free hot loop. Victims
+        # still tearing down are left out, or a dying hog would re-trip.
+        hog_pid, hog_gb, hog_path = None, None, ""
+        if level < cfg.hog_level:
+            tearing_down = {p for when, _g, p in kills if now - when <= RESIDENT_EXCLUDE_S}
+            hog_pid, hog_gb, hog_path = largest_job(exclude | tearing_down)
+
+        verdict = evaluate(level, swap, growth, strikes, cfg, swap_kill, hog_gb, hog_kill,
+                           fill_growth, fill_kill)
         strikes = verdict.strikes
 
         if level < cfg.warn_level or verdict.action != "clear":
             rate = "n/a" if growth is None else f"{growth:+.1f}GB/{cfg.swap_rate_s:.0f}s"
+            hog = "" if hog_pid is None else f" largest_job={hog_gb:.1f}GB pid={hog_pid}"
+            fill = "n/a" if fill_growth is None else f"{fill_growth:+.1f}GB/{cfg.fill_s:.0f}s"
             _log(fh, f"[oom-guard] {verdict.why or 'warn'}: memorystatus_level={level} "
-                     f"swap_used={swap:.1f}GB rate={rate} "
+                     f"swap_used={swap:.1f}GB rate={rate} fill={fill}{hog} "
                      f"strikes={strikes:.1f}/{cfg.strikes}")
         elif now - last_heartbeat > 60:
             last_heartbeat = now
             _log(fh, f"[oom-guard] ok: level={level} swap={swap:.1f}GB "
-                     f"(worst level={worst_level} peak swap={peak_swap:.1f}GB)")
+                     f"(worst level={worst_level} peak swap={peak_swap:.1f}GB) "
+                     f"fill={'n/a' if fill_growth is None else f'{fill_growth:+.1f}GB'}")
             worst_level, peak_swap = 100, 0.0
 
         if verdict.action != "kill":
@@ -694,7 +805,10 @@ def run(cfg, logfile="/var/log/macos-oom-guard.log"):
                 strikes = max(strikes, cfg.strikes - 1)
                 continue
             victims_exclude = exclude | set(resident)
-        pid, gb, path = find_victim(cfg.min_victim_gb, victims_exclude)
+        if verdict.why == "hog" and hog_pid not in victims_exclude:
+            pid, gb, path = hog_pid, hog_gb, hog_path
+        else:
+            pid, gb, path = find_victim(cfg.min_victim_gb, victims_exclude)
         if pid is None:
             _log(fh, f"[oom-guard] TRIP but no eligible victim >= {cfg.min_victim_gb}GB "
                      f"(biggest seen {gb:.1f}GB {path or '-'}); holding")
@@ -789,6 +903,12 @@ def _plist(python_bin, script_path, cfg):
         "OOMG_STRIKE_DECAY": str(cfg.strike_decay),
         "OOMG_POLL_S": str(cfg.poll_s),
         "OOMG_FAMILY_WINDOW_S": str(cfg.family_window_s),
+        "OOMG_HOG_FRAC": str(cfg.hog_frac),
+        "OOMG_HOG_LEVEL": str(cfg.hog_level),
+        "OOMG_FILL_MULT": str(cfg.fill_mult),
+        "OOMG_FILL_GB": str(cfg.fill_gb),
+        "OOMG_FILL_S": str(cfg.fill_s),
+        "OOMG_FILL_LEVEL": str(cfg.fill_level),
         "OOMG_DRY_RUN": "1" if cfg.dry_run else "0",
         "DEVELOPER_DIR": DAEMON_DEVELOPER_DIR,
     }

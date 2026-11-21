@@ -45,13 +45,25 @@ top eligible (killable) processes by phys_footprint:
 
 - **Triggers on `kern.memorystatus_level`** — a `0..100` "% memory available" gauge
   that jetsam itself trends on and that falls *smoothly* as memory fills (unlike the
-  bucketed pressure level). It **never** triggers on memory footprint: a healthy Mac
+  bucketed pressure level). It never triggers on *total* footprint: a healthy Mac
   can sit at a huge footprint of compressed/sparse data while perfectly green.
-  Footprint is only used to *rank* victims. A level below the panic threshold
-  kills on the first sample; above it, trips accumulate in a leaky bucket so an
-  oscillating burst still arms. Two swap arms back it up: swap growing faster
-  than a set rate (the one that discriminates a runaway), and swap past a
-  multiple of RAM as a last resort.
+  A level below the panic threshold kills on the first sample; above it, trips
+  accumulate in a leaky bucket so an oscillating burst still arms. Two swap arms
+  back it up: swap growing faster than a set rate, and swap past a multiple of
+  RAM as a last resort.
+- **Kills a single runaway job before the level moves.** Jetsam defends
+  `memorystatus_level` by killing system daemons, so one job growing a few GB a
+  minute can reach more than RAM while the level stays in the 20s and no other
+  arm fires. The hog arm trips when one non-app process passes
+  `OOMG_HOG_FRAC × RAM` while the level is below `OOMG_HOG_LEVEL`, and kills that
+  process. Apps (a VM, a browser, an IDE) are exempt from this arm.
+- **Kills when swap fills toward its ceiling, whatever the level says.** On this
+  host jetsam holds the level in the mid-30s while swap climbs, and every
+  excursion that reached 36-40 GB of swap ended in a mass kill or a panic. The
+  fill arm trips when swap passes `OOMG_FILL_MULT × RAM` *and* is still growing by
+  more than `OOMG_FILL_GB` over `OOMG_FILL_S`, with the level below
+  `OOMG_FILL_LEVEL`. Growth is required, so high but stable swap, or swap left
+  behind after a kill, never trips it.
 - **Ranks victims by `ri_phys_footprint`** (`proc_pid_rusage`) — the same metric
   Activity Monitor's "Memory" column and jetsam use. (A swapped hog's RSS collapses,
   and footprint measured from outside overcounts compressed pages — `phys_footprint`
@@ -135,6 +147,12 @@ All tunable via environment variables (also baked into the plist at `--install`)
 | `OOMG_STRIKE_DECAY` | bucket drain per clean sample; must be < 1 | `0.5` |
 | `OOMG_POLL_S` | poll interval, seconds | `1.0` |
 | `OOMG_FAMILY_WINDOW_S` | a repeat victim's process group within this window is killed whole; `0` disables | `300` |
+| `OOMG_HOG_FRAC` | also kill one non-app process whose footprint passes `FRAC × RAM`… | `0.75` |
+| `OOMG_HOG_LEVEL` | …while `memorystatus_level` is below this | `50` |
+| `OOMG_FILL_MULT` | fill arm: swap past `MULT × RAM`… | `0.85` |
+| `OOMG_FILL_GB` | …still growing by more than this many GB… | `1.0` |
+| `OOMG_FILL_S` | …over this trailing window (seconds)… | `120` |
+| `OOMG_FILL_LEVEL` | …while `memorystatus_level` is below this | `50` |
 | `OOMG_DRY_RUN` | `1` = log but never kill | `0` |
 
 ## Choosing what gets killed
